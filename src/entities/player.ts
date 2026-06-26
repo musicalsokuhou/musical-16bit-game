@@ -54,9 +54,9 @@ export class Player {
     return { x: this.x, y: this.y, w: PLAYER_SPRITE.width, h: PLAYER_SPRITE.height };
   }
 
-  respawn(): void {
-    this.x = this.startX;
-    this.y = this.startY;
+  respawn(x: number = this.startX, y: number = this.startY): void {
+    this.x = x;
+    this.y = y;
     this.vx = 0;
     this.vy = 0;
   }

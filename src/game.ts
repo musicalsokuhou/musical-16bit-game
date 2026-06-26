@@ -1,20 +1,27 @@
 import { Input } from "./input";
-import { Player } from "./entities/player";
+import { Player, PLAYER_SPRITE } from "./entities/player";
 import { MusicNote } from "./entities/note";
-import { platforms, noteSpecs, LEVEL_WIDTH, GROUND_Y, GOAL_X, type Rect } from "./level";
+import { LevelGenerator, GROUND_Y, LOOKAHEAD, DESPAWN_BEHIND, type Rect, type Checkpoint } from "./level";
 
 const VIEW_WIDTH = 320;
 const VIEW_HEIGHT = 180;
 
-type GameState = "playing" | "win";
-
 export class Game {
   private readonly ctx: CanvasRenderingContext2D;
   private readonly player: Player;
-  private readonly notes: MusicNote[];
+  private readonly generator = new LevelGenerator();
+
+  private platforms: Rect[] = [];
+  private notes: MusicNote[] = [];
+  private checkpoints: Checkpoint[] = [];
+  private passedCheckpoints = new Set<number>();
+  private checkpointCount = 0;
+  private checkpointToastUntil = 0;
+
+  private respawnPlatform: Rect = { x: 0, y: GROUND_Y, w: 80, h: 30 };
+  private respawnPoint = { x: 20, y: GROUND_Y - PLAYER_SPRITE.height };
 
   private score = 0;
-  private state: GameState = "playing";
   private lastTime = 0;
   private elapsed = 0;
 
@@ -27,8 +34,8 @@ export class Game {
     ctx.imageSmoothingEnabled = false;
     this.ctx = ctx;
 
-    this.player = new Player(20, GROUND_Y - 14);
-    this.notes = noteSpecs.map((n) => new MusicNote(n.x, n.y));
+    this.player = new Player(20, GROUND_Y - PLAYER_SPRITE.height);
+    this.reset();
   }
 
   start(): void {
@@ -43,27 +50,33 @@ export class Game {
     if (this.input.isRestartPressed()) {
       this.reset();
     }
-    if (this.state === "playing") {
-      this.update(dt);
-    }
+    this.update(dt);
     this.draw();
 
     requestAnimationFrame(this.loop);
   };
 
   private reset(): void {
-    this.player.respawn();
-    this.notes.forEach((n) => (n.collected = false));
+    const start = this.generator.reset();
+    this.platforms = [start];
+    this.notes = [];
+    this.checkpoints = [];
+    this.passedCheckpoints = new Set();
+    this.checkpointCount = 0;
+    this.checkpointToastUntil = 0;
     this.score = 0;
-    this.state = "playing";
+    this.respawnPlatform = { x: 0, y: GROUND_Y, w: 80, h: 30 };
+    this.respawnPoint = { x: 20, y: GROUND_Y - PLAYER_SPRITE.height };
+    this.player.respawn(this.respawnPoint.x, this.respawnPoint.y);
+    this.extendLevel();
   }
 
   private update(dt: number): void {
-    this.player.update(dt, this.input.isLeft(), this.input.isRight(), this.input.isJumpPressed(), platforms);
-    this.player.x = Math.max(0, Math.min(this.player.x, LEVEL_WIDTH));
+    this.player.update(dt, this.input.isLeft(), this.input.isRight(), this.input.isJumpPressed(), this.collidablePlatforms());
+    this.player.x = Math.max(0, this.player.x);
 
     if (this.player.y > VIEW_HEIGHT + 60) {
-      this.player.respawn();
+      this.player.respawn(this.respawnPoint.x, this.respawnPoint.y);
     }
 
     for (const note of this.notes) {
@@ -73,14 +86,42 @@ export class Game {
       }
     }
 
-    if (this.player.x >= GOAL_X) {
-      this.state = "win";
+    this.checkCheckpoints();
+    this.extendLevel();
+    this.pruneLevel();
+  }
+
+  private checkCheckpoints(): void {
+    for (const cp of this.checkpoints) {
+      if (this.passedCheckpoints.has(cp.index) || this.player.x < cp.x) continue;
+      this.passedCheckpoints.add(cp.index);
+      this.checkpointCount = cp.index;
+      this.respawnPlatform = { x: cp.x - 20, y: cp.y, w: 60, h: 30 };
+      this.respawnPoint = { x: cp.x, y: cp.y - PLAYER_SPRITE.height };
+      this.checkpointToastUntil = this.elapsed + 1.4;
     }
   }
 
+  private collidablePlatforms(): Rect[] {
+    return [...this.platforms, this.respawnPlatform];
+  }
+
+  private extendLevel(): void {
+    const targetX = this.cameraX() + VIEW_WIDTH + LOOKAHEAD;
+    const generated = this.generator.generateUntil(targetX);
+    for (const p of generated.platforms) this.platforms.push(p);
+    for (const n of generated.notes) this.notes.push(new MusicNote(n.x, n.y));
+    for (const c of generated.checkpoints) this.checkpoints.push(c);
+  }
+
+  private pruneLevel(): void {
+    const cutoff = this.cameraX() - DESPAWN_BEHIND;
+    this.platforms = this.platforms.filter((p) => p.x + p.w >= cutoff);
+    this.notes = this.notes.filter((n) => n.x >= cutoff);
+  }
+
   private cameraX(): number {
-    const raw = this.player.x - VIEW_WIDTH / 2;
-    return Math.max(0, Math.min(raw, LEVEL_WIDTH - VIEW_WIDTH));
+    return Math.max(0, this.player.x - VIEW_WIDTH / 2);
   }
 
   private draw(): void {
@@ -92,12 +133,11 @@ export class Game {
 
     this.drawCurtains(cameraX);
     this.drawPlatforms(cameraX);
-    this.drawGoal(cameraX);
+    this.drawCheckpoints(cameraX);
     for (const note of this.notes) note.draw(ctx, cameraX, this.elapsed);
     this.player.draw(ctx, cameraX);
     this.drawHud();
-
-    if (this.state === "win") this.drawWinOverlay();
+    this.drawCheckpointToast();
   }
 
   private drawCurtains(cameraX: number): void {
@@ -112,7 +152,7 @@ export class Game {
 
   private drawPlatforms(cameraX: number): void {
     const ctx = this.ctx;
-    for (const p of platforms) {
+    for (const p of this.collidablePlatforms()) {
       ctx.fillStyle = "#caa24a";
       ctx.fillRect(p.x - cameraX, p.y, p.w, p.h);
       ctx.fillStyle = "#8a6a2a";
@@ -120,15 +160,20 @@ export class Game {
     }
   }
 
-  private drawGoal(cameraX: number): void {
+  private drawCheckpoints(cameraX: number): void {
     const ctx = this.ctx;
-    const x = GOAL_X - cameraX;
-    ctx.fillStyle = "#ffe9a8";
-    ctx.beginPath();
-    ctx.ellipse(x + 10, GROUND_Y - 60, 30, 60, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = "#3a2e6e";
-    ctx.fillRect(x, GROUND_Y - 90, 4, 90);
+    for (const cp of this.checkpoints) {
+      const x = cp.x - cameraX;
+      if (x < -20 || x > VIEW_WIDTH + 20) continue;
+      ctx.fillStyle = this.passedCheckpoints.has(cp.index) ? "#7fdca0" : "#ffe9a8";
+      ctx.fillRect(x - 1, cp.y - 40, 2, 40);
+      ctx.beginPath();
+      ctx.moveTo(x + 1, cp.y - 40);
+      ctx.lineTo(x + 14, cp.y - 34);
+      ctx.lineTo(x + 1, cp.y - 28);
+      ctx.closePath();
+      ctx.fill();
+    }
   }
 
   private drawHud(): void {
@@ -136,19 +181,18 @@ export class Game {
     ctx.fillStyle = "#ffffff";
     ctx.font = "10px monospace";
     ctx.textBaseline = "top";
-    ctx.fillText(`♪ x ${this.score} / ${this.notes.length}`, 6, 6);
+    ctx.fillText(`♪ x ${this.score}`, 6, 6);
+    ctx.fillText(`⛳ ${this.checkpointCount}`, 6, 18);
+    ctx.fillText(`${Math.floor(this.player.x / 8)}m`, 6, 30);
   }
 
-  private drawWinOverlay(): void {
+  private drawCheckpointToast(): void {
+    if (this.elapsed >= this.checkpointToastUntil) return;
     const ctx = this.ctx;
-    ctx.fillStyle = "rgba(0,0,0,0.6)";
-    ctx.fillRect(0, 0, VIEW_WIDTH, VIEW_HEIGHT);
     ctx.fillStyle = "#ffe9a8";
-    ctx.font = "16px monospace";
+    ctx.font = "12px monospace";
     ctx.textAlign = "center";
-    ctx.fillText("BRAVO!", VIEW_WIDTH / 2, VIEW_HEIGHT / 2 - 10);
-    ctx.font = "10px monospace";
-    ctx.fillText("R / ↻ to take another bow", VIEW_WIDTH / 2, VIEW_HEIGHT / 2 + 10);
+    ctx.fillText(`CHECKPOINT ${this.checkpointCount}`, VIEW_WIDTH / 2, 50);
     ctx.textAlign = "left";
   }
 }
